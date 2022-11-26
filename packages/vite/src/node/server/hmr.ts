@@ -196,9 +196,10 @@ export async function handleFileAddUnlink(
   file: string,
   server: ViteDevServer
 ): Promise<void> {
-  const modules = [...(server.moduleGraph.getModulesByFile(file) || [])]
-
-  modules.push(...getAffectedGlobModules(file, server))
+  const modules = [
+    ...(server.moduleGraph.getModulesByFile(file) || []),
+    ...getAffectedGlobModules(file, server)
+  ]
 
   if (modules.length > 0) {
     updateModules(

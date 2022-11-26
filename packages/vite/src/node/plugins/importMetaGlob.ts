@@ -1,20 +1,18 @@
 import { isAbsolute, posix } from 'node:path'
 import micromatch from 'micromatch'
 import colors from 'picocolors'
-import { stripLiteral } from 'strip-literal'
 import type {
   ArrayExpression,
   CallExpression,
   Expression,
   Literal,
-  MemberExpression,
   Node,
-  SequenceExpression,
   SpreadElement,
   TemplateLiteral
 } from 'estree'
-import { parseExpressionAt } from 'acorn'
 import { findNodeAt } from 'acorn-walk'
+import type { Token, TokenType } from 'acorn'
+import { parseExpressionAt, tokTypes, tokenizer } from 'acorn'
 import MagicString from 'magic-string'
 import fg from 'fast-glob'
 import { stringifyQuery } from 'ufo'
@@ -35,7 +33,6 @@ import { isCSSRequest, isModuleCSSRequest } from './css'
 const { isMatch, scan } = micromatch
 
 export interface ParsedImportGlob {
-  match: RegExpMatchArray
   index: number
   globs: string[]
   globsResolved: string[]
@@ -46,19 +43,18 @@ export interface ParsedImportGlob {
   end: number
 }
 
-export function getAffectedGlobModules(
+export function* getAffectedGlobModules(
   file: string,
   server: ViteDevServer
-): ModuleNode[] {
-  const modules: ModuleNode[] = []
+): Generator<ModuleNode> {
   for (const [id, allGlobs] of server._importGlobMap!) {
-    if (allGlobs.some((glob) => isMatch(file, glob)))
-      modules.push(...(server.moduleGraph.getModulesByFile(id) || []))
+    if (allGlobs.some((glob) => isMatch(file, glob))) {
+      for (const node of server.moduleGraph.getModulesByFile(id) || []) {
+        if (node?.file) server.moduleGraph.onFileChange(node.file)
+        yield node
+      }
+    }
   }
-  modules.forEach((i) => {
-    if (i?.file) server.moduleGraph.onFileChange(i.file)
-  })
-  return modules
 }
 
 export function importGlobPlugin(config: ResolvedConfig): Plugin {
@@ -91,8 +87,126 @@ export function importGlobPlugin(config: ResolvedConfig): Plugin {
   }
 }
 
-const importGlobRE =
-  /\bimport\.meta\.(glob|globEager|globEagerDefault)(?:<\w+>)?\s*\(/g
+const globTypeRE = /^(?:glob|globEager|globEagerDefault)$/
+
+const {
+  eof: EOF,
+  _import: IMPORT,
+  name: NAME,
+  dot: DOT,
+  parenL: LEFT_PAREN
+} = tokTypes
+
+function* findGlobImports(
+  code: string
+): Generator<[number, 'glob' | 'globEager' | 'globEagerDefault']> {
+  const tokenStream = tokenizer(code, {
+    ecmaVersion: 'latest',
+    sourceType: 'module',
+    ranges: true
+  })
+
+  let currentTok!: Token
+  const next = (type: TokenType) => {
+    currentTok = tokenStream.getToken()
+    if (currentTok.type === type) return currentTok
+  }
+
+  while (!next(EOF)) {
+    if (currentTok.type === IMPORT) {
+      const { start } = currentTok
+
+      if (
+        next(DOT) &&
+        next(NAME)?.value === 'meta' &&
+        next(DOT) &&
+        next(NAME)
+      ) {
+        const type = currentTok.value
+        if (globTypeRE.test(type) && next(LEFT_PAREN)) yield [start, type]
+      }
+    }
+  }
+}
+
+function parseGlobExprAt(code: string, start: number) {
+  let ast: Node
+  let lastTokenPos: number | undefined
+
+  try {
+    ast = parseExpressionAt(code, start, {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      ranges: true,
+      onToken: (token) => {
+        lastTokenPos = token.end
+      }
+    }) as any
+  } catch (e) {
+    const _e = e as any
+
+    if (_e.message?.startsWith('Unterminated string constant')) return
+
+    if (lastTokenPos == null || lastTokenPos <= start) throw _e
+
+    // tailing comma in object or array will make the parser think it's a comma operation
+    // we try to parse again removing the comma
+    try {
+      ast = parseExpressionAt(
+        code.slice(0, lastTokenPos).replace(/[,\s]*$/, ''), // slice from 0 to keep the ast position
+        start,
+        {
+          ecmaVersion: 'latest',
+          sourceType: 'module',
+          ranges: true
+        }
+      ) as any
+    } catch {
+      throw _e
+    }
+  }
+
+  return ast
+}
+
+type ErrFn = (msg: string, pos?: number) => Error
+function extractGlobStrings(
+  arg1: ArrayExpression | Literal | TemplateLiteral,
+  err: ErrFn
+) {
+  const globs: string[] = []
+
+  const validateLiteral = (element: Expression | SpreadElement | null) => {
+    if (!element) return
+    if (element.type === 'Literal') {
+      if (typeof element.value !== 'string')
+        throw err(
+          `Expected glob to be a string, but got "${typeof element.value}"`,
+          element.range![0]
+        )
+      globs.push(element.value)
+    } else if (element.type === 'TemplateLiteral') {
+      if (element.expressions.length !== 0) {
+        throw err(
+          `Expected glob to be a string, but got dynamic template literal`,
+          element.range![0]
+        )
+      }
+      globs.push(element.quasis[0].value.raw)
+    } else {
+      throw err('Could only use literals', element.range![0])
+    }
+  }
+
+  if (arg1.type === 'ArrayExpression') {
+    for (const element of arg1.elements) {
+      validateLiteral(element)
+    }
+  } else {
+    validateLiteral(arg1)
+  }
+  return globs
+}
 
 const knownOptions = {
   as: 'string',
@@ -102,6 +216,107 @@ const knownOptions = {
 } as const
 
 const forceDefaultAs = ['raw', 'url']
+function extractGlobOptions(
+  arg2: Node | undefined,
+  err: ErrFn,
+  globType: string
+) {
+  // arg2
+  const options: GeneralImportGlobOptions = {}
+  if (arg2) {
+    if (arg2.type !== 'ObjectExpression')
+      throw err(
+        `Expected the second argument o to be a object literal, but got "${arg2.type}"`,
+        arg2.range![0]
+      )
+
+    for (const property of arg2.properties) {
+      if (
+        property.type === 'SpreadElement' ||
+        (property.key.type !== 'Identifier' && property.key.type !== 'Literal')
+      )
+        throw err('Could only use literals', property.range![0])
+
+      const name = ((property.key as any).name ||
+        (property.key as any).value) as keyof GeneralImportGlobOptions
+      if (name === 'query') {
+        if (property.value.type === 'ObjectExpression') {
+          const data: Record<string, string> = {}
+          for (const prop of property.value.properties) {
+            if (
+              prop.type === 'SpreadElement' ||
+              prop.key.type !== 'Identifier' ||
+              prop.value.type !== 'Literal'
+            )
+              throw err('Could only use literals', prop.range![0])
+            data[prop.key.name] = prop.value.value as any
+          }
+          options.query = data
+        } else if (property.value.type === 'Literal') {
+          if (typeof property.value.value !== 'string')
+            throw err(
+              `Expected query to be a string, but got "${typeof property.value
+                .value}"`,
+              property.value.range![0]
+            )
+          options.query = property.value.value
+        } else {
+          throw err('Could only use literals', property.value.range![0])
+        }
+        continue
+      }
+
+      if (!(name in knownOptions))
+        throw err(`Unknown options ${name}`, property.range![0])
+
+      if (property.value.type !== 'Literal')
+        throw err(
+          `Expected the value of option "${name}" to be a literal, but got an "${property.value.type}"`,
+          property.value.range![0]
+        )
+
+      const valueType = typeof property.value.value
+      if (valueType === 'undefined') continue
+
+      if (valueType !== knownOptions[name])
+        throw err(
+          `Expected the type of option "${name}" to be "${knownOptions[name]}", but got "${valueType}"`,
+          property.value.range![0]
+        )
+      options[name] = property.value.value as any
+    }
+  }
+
+  if (options.as && forceDefaultAs.includes(options.as)) {
+    if (
+      options.import &&
+      options.import !== 'default' &&
+      options.import !== '*'
+    )
+      throw err(
+        `Option "import" can only be "default" or "*" when "as" is "${options.as}", but got "${options.import}"`,
+        arg2?.range![0]
+      )
+    options.import = options.import || 'default'
+  }
+
+  if (options.as && options.query)
+    throw err(
+      'Options "as" and "query" cannot be used together',
+      arg2?.range![0]
+    )
+
+  if (options.as) options.query = options.as
+
+  // TODO: backwards compatibility
+  if (globType === 'globEager') options.eager = true
+  if (globType === 'globEagerDefault') {
+    options.eager = true
+    options.import = 'default'
+  }
+
+  return options
+}
 
 export async function parseImportGlob(
   code: string,
@@ -109,60 +324,15 @@ export async function parseImportGlob(
   root: string,
   resolveId: IdResolver
 ): Promise<ParsedImportGlob[]> {
-  let cleanCode
-  try {
-    cleanCode = stripLiteral(code)
-  } catch (e) {
-    // skip invalid js code
-    return []
-  }
-  const matches = Array.from(cleanCode.matchAll(importGlobRE))
-
-  const tasks = matches.map(async (match, index) => {
-    const type = match[1]
-    const start = match.index!
-
-    const err = (msg: string) => {
+  const tasks = [...findGlobImports(code)].map(async ([start, type], index) => {
+    const err = (msg: string, pos = start) => {
       const e = new Error(`Invalid glob import syntax: ${msg}`)
-      ;(e as any).pos = start
+      ;(e as any).pos = pos
       return e
     }
 
-    let ast: CallExpression | SequenceExpression | MemberExpression
-    let lastTokenPos: number | undefined
-
-    try {
-      ast = parseExpressionAt(code, start, {
-        ecmaVersion: 'latest',
-        sourceType: 'module',
-        ranges: true,
-        onToken: (token) => {
-          lastTokenPos = token.end
-        }
-      }) as any
-    } catch (e) {
-      const _e = e as any
-      if (_e.message && _e.message.startsWith('Unterminated string constant'))
-        return undefined!
-      if (lastTokenPos == null || lastTokenPos <= start) throw _e
-
-      // tailing comma in object or array will make the parser think it's a comma operation
-      // we try to parse again removing the comma
-      try {
-        const statement = code.slice(start, lastTokenPos).replace(/[,\s]*$/, '')
-        ast = parseExpressionAt(
-          ' '.repeat(start) + statement, // to keep the ast position
-          start,
-          {
-            ecmaVersion: 'latest',
-            sourceType: 'module',
-            ranges: true
-          }
-        ) as any
-      } catch {
-        throw _e
-      }
-    }
+    let ast = parseGlobExprAt(code, start)
+    if (!ast) return undefined!
 
     const found = findNodeAt(ast as any, start, undefined, 'CallExpression')
     if (!found) throw err(`Expect CallExpression, got ${ast.type}`)
@@ -171,115 +341,16 @@ export async function parseImportGlob(
     if (ast.arguments.length < 1 || ast.arguments.length > 2)
       throw err(`Expected 1-2 arguments, but got ${ast.arguments.length}`)
 
-    const arg1 = ast.arguments[0] as ArrayExpression | Literal | TemplateLiteral
-    const arg2 = ast.arguments[1] as Node | undefined
+    const globs = extractGlobStrings(
+      ast.arguments[0] as ArrayExpression | Literal | TemplateLiteral,
+      err
+    )
 
-    const globs: string[] = []
-
-    const validateLiteral = (element: Expression | SpreadElement | null) => {
-      if (!element) return
-      if (element.type === 'Literal') {
-        if (typeof element.value !== 'string')
-          throw err(
-            `Expected glob to be a string, but got "${typeof element.value}"`
-          )
-        globs.push(element.value)
-      } else if (element.type === 'TemplateLiteral') {
-        if (element.expressions.length !== 0) {
-          throw err(
-            `Expected glob to be a string, but got dynamic template literal`
-          )
-        }
-        globs.push(element.quasis[0].value.raw)
-      } else {
-        throw err('Could only use literals')
-      }
-    }
-
-    if (arg1.type === 'ArrayExpression') {
-      for (const element of arg1.elements) {
-        validateLiteral(element)
-      }
-    } else {
-      validateLiteral(arg1)
-    }
-
-    // arg2
-    const options: GeneralImportGlobOptions = {}
-    if (arg2) {
-      if (arg2.type !== 'ObjectExpression')
-        throw err(
-          `Expected the second argument o to be a object literal, but got "${arg2.type}"`
-        )
-
-      for (const property of arg2.properties) {
-        if (
-          property.type === 'SpreadElement' ||
-          (property.key.type !== 'Identifier' &&
-            property.key.type !== 'Literal')
-        )
-          throw err('Could only use literals')
-
-        const name = ((property.key as any).name ||
-          (property.key as any).value) as keyof GeneralImportGlobOptions
-        if (name === 'query') {
-          if (property.value.type === 'ObjectExpression') {
-            const data: Record<string, string> = {}
-            for (const prop of property.value.properties) {
-              if (
-                prop.type === 'SpreadElement' ||
-                prop.key.type !== 'Identifier' ||
-                prop.value.type !== 'Literal'
-              )
-                throw err('Could only use literals')
-              data[prop.key.name] = prop.value.value as any
-            }
-            options.query = data
-          } else if (property.value.type === 'Literal') {
-            if (typeof property.value.value !== 'string')
-              throw err(
-                `Expected query to be a string, but got "${typeof property.value
-                  .value}"`
-              )
-            options.query = property.value.value
-          } else {
-            throw err('Could only use literals')
-          }
-          continue
-        }
-
-        if (!(name in knownOptions)) throw err(`Unknown options ${name}`)
-
-        if (property.value.type !== 'Literal')
-          throw err('Could only use literals')
-
-        const valueType = typeof property.value.value
-        if (valueType === 'undefined') continue
-
-        if (valueType !== knownOptions[name])
-          throw err(
-            `Expected the type of option "${name}" to be "${knownOptions[name]}", but got "${valueType}"`
-          )
-        options[name] = property.value.value as any
-      }
-    }
-
-    if (options.as && forceDefaultAs.includes(options.as)) {
-      if (
-        options.import &&
-        options.import !== 'default' &&
-        options.import !== '*'
-      )
-        throw err(
-          `Option "import" can only be "default" or "*" when "as" is "${options.as}", but got "${options.import}"`
-        )
-      options.import = options.import || 'default'
-    }
-
-    if (options.as && options.query)
-      throw err('Options "as" and "query" cannot be used together')
-
-    if (options.as) options.query = options.as
+    const options = extractGlobOptions(
+      ast.arguments[1] as Node | undefined,
+      err,
+      type
+    )
 
     const end = ast.range![1]
 
@@ -289,7 +360,6 @@ export async function parseImportGlob(
     const isRelative = globs.every((i) => '.!'.includes(i[0]))
 
     return {
-      match,
       index,
       globs,
       globsResolved,
@@ -314,9 +384,6 @@ export interface TransformGlobImportResult {
   files: Set<string>
 }
 
-/**
- * @param optimizeExport for dynamicImportVar plugin don't need to optimize export.
- */
 export async function transformGlobImport(
   code: string,
   id: string,
@@ -328,25 +395,16 @@ export async function transformGlobImport(
   id = slash(id)
   root = slash(root)
   const isVirtual = isVirtualModule(id)
-  const dir = isVirtual ? undefined : dirname(id)
   const matches = await parseImportGlob(
     code,
     isVirtual ? undefined : id,
     root,
     resolveId
   )
-  const matchedFiles = new Set<string>()
-
-  // TODO: backwards compatibility
-  matches.forEach((i) => {
-    if (i.type === 'globEager') i.options.eager = true
-    if (i.type === 'globEagerDefault') {
-      i.options.eager = true
-      i.options.import = 'default'
-    }
-  })
-
   if (!matches.length) return null
+
+  const dir = isVirtual ? undefined : dirname(id)
+  const matchedFiles = new Set<string>()
 
   const s = new MagicString(code)
 

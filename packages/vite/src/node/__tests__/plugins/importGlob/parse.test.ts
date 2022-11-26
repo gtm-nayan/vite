@@ -258,8 +258,10 @@ describe('parse negatives', async () => {
     )
   })
 
-  it('in string', async () => {
-    expect(await runError('"import.meta.glob()"')).toBeUndefined()
+  it('in string or comment', async () => {
+    expect(
+      await run('"import.meta.glob()" /* import.meta.glob() */')
+    ).toHaveLength(0)
   })
 
   it('variable', async () => {
@@ -343,7 +345,7 @@ describe('parse negatives', async () => {
     expect(
       await runError('import.meta.glob("hey", { import: hey })')
     ).toMatchInlineSnapshot(
-      '[Error: Invalid glob import syntax: Could only use literals]'
+      '[Error: Invalid glob import syntax: Expected the value of option "import" to be a literal, but got an "Identifier"]'
     )
     expect(
       await runError('import.meta.glob("hey", { eager: 123 })')
