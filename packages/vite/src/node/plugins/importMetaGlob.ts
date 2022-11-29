@@ -129,6 +129,12 @@ function* findGlobImports(
   }
 }
 
+const err = (msg: string, pos: number) => {
+  const e = new Error(`Invalid glob import syntax: ${msg}`)
+  ;(e as any).pos = pos
+  return e
+}
+
 function parseGlobExprAt(code: string, start: number) {
   let ast: Node
   let lastTokenPos: number | undefined
@@ -166,14 +172,12 @@ function parseGlobExprAt(code: string, start: number) {
     }
   }
 
-  return ast
+  const found = findNodeAt(ast as any, start, undefined, 'CallExpression')
+  if (!found) throw err(`Expect CallExpression, got ${ast.type}`, start)
+  return found.node as unknown as CallExpression
 }
 
-type ErrFn = (msg: string, pos?: number) => Error
-function extractGlobStrings(
-  arg1: ArrayExpression | Literal | TemplateLiteral,
-  err: ErrFn
-) {
+function extractGlobStrings(arg1: ArrayExpression | Literal | TemplateLiteral) {
   const globs: string[] = []
 
   const validateLiteral = (element: Expression | SpreadElement | null) => {
@@ -220,18 +224,15 @@ const knownOptions = {
 } as const
 
 const forceDefaultAs = ['raw', 'url']
-function extractGlobOptions(
-  arg2: Node | undefined,
-  err: ErrFn,
-  globType: string
-) {
-  // arg2
+function extractGlobOptions(arg2: Node | undefined, globType: string) {
   const options: GeneralImportGlobOptions = {}
+
   if (arg2) {
+    const start = arg2.range![0]
     if (arg2.type !== 'ObjectExpression')
       throw err(
         `Expected the second argument o to be a object literal, but got "${arg2.type}"`,
-        arg2.range![0]
+        start
       )
 
     for (const property of arg2.properties) {
@@ -289,28 +290,27 @@ function extractGlobOptions(
         )
       options[name] = property.value.value as any
     }
+
+    if (options.as) {
+      if (forceDefaultAs.includes(options.as)) {
+        if (
+          options.import &&
+          options.import !== 'default' &&
+          options.import !== '*'
+        )
+          throw err(
+            `Option "import" can only be "default" or "*" when "as" is "${options.as}", but got "${options.import}"`,
+            start
+          )
+        options.import = options.import || 'default'
+      }
+
+      if (options.query)
+        throw err('Options "as" and "query" cannot be used together', start)
+
+      options.query = options.as
+    }
   }
-
-  if (options.as && forceDefaultAs.includes(options.as)) {
-    if (
-      options.import &&
-      options.import !== 'default' &&
-      options.import !== '*'
-    )
-      throw err(
-        `Option "import" can only be "default" or "*" when "as" is "${options.as}", but got "${options.import}"`,
-        arg2?.range![0]
-      )
-    options.import = options.import || 'default'
-  }
-
-  if (options.as && options.query)
-    throw err(
-      'Options "as" and "query" cannot be used together',
-      arg2?.range![0]
-    )
-
-  if (options.as) options.query = options.as
 
   // TODO: backwards compatibility
   if (globType === 'globEager') options.eager = true
@@ -329,30 +329,21 @@ export async function parseImportGlob(
   resolveId: IdResolver
 ): Promise<ParsedImportGlob[]> {
   const tasks = [...findGlobImports(code)].map(async ([start, type], index) => {
-    const err = (msg: string, pos = start) => {
-      const e = new Error(`Invalid glob import syntax: ${msg}`)
-      ;(e as any).pos = pos
-      return e
-    }
-
-    let ast = parseGlobExprAt(code, start)
+    const ast = parseGlobExprAt(code, start)
     if (!ast) return undefined!
 
-    const found = findNodeAt(ast as any, start, undefined, 'CallExpression')
-    if (!found) throw err(`Expect CallExpression, got ${ast.type}`)
-    ast = found.node as unknown as CallExpression
-
     if (ast.arguments.length < 1 || ast.arguments.length > 2)
-      throw err(`Expected 1-2 arguments, but got ${ast.arguments.length}`)
+      throw err(
+        `Expected 1-2 arguments, but got ${ast.arguments.length}`,
+        start
+      )
 
     const globs = extractGlobStrings(
-      ast.arguments[0] as ArrayExpression | Literal | TemplateLiteral,
-      err
+      ast.arguments[0] as ArrayExpression | Literal | TemplateLiteral
     )
 
     const options = extractGlobOptions(
       ast.arguments[1] as Node | undefined,
-      err,
       type
     )
 
