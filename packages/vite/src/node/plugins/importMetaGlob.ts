@@ -178,23 +178,27 @@ function extractGlobStrings(
 
   const validateLiteral = (element: Expression | SpreadElement | null) => {
     if (!element) return
-    if (element.type === 'Literal') {
+
+    const { type, range } = element
+    const start = range![0]
+
+    if (type === 'Literal') {
       if (typeof element.value !== 'string')
         throw err(
           `Expected glob to be a string, but got "${typeof element.value}"`,
-          element.range![0]
+          start
         )
       globs.push(element.value)
-    } else if (element.type === 'TemplateLiteral') {
+    } else if (type === 'TemplateLiteral') {
       if (element.expressions.length !== 0) {
         throw err(
-          `Expected glob to be a string, but got dynamic template literal`,
-          element.range![0]
+          `Expected glob to be a static string, but got dynamic template literal`,
+          start
         )
       }
       globs.push(element.quasis[0].value.raw)
     } else {
-      throw err('Could only use literals', element.range![0])
+      throw err(`Expected glob to be a static string, but got "${type}"`, start)
     }
   }
 

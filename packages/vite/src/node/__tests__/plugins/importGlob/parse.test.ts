@@ -266,7 +266,7 @@ describe('parse negatives', async () => {
 
   it('variable', async () => {
     expect(await runError('import.meta.glob(hey)')).toMatchInlineSnapshot(
-      '[Error: Invalid glob import syntax: Could only use literals]'
+      '[Error: Invalid glob import syntax: Expected glob to be a static string, but got "Identifier"]'
     )
   })
 
@@ -274,7 +274,7 @@ describe('parse negatives', async () => {
     expect(
       await runError('import.meta.glob(`hi ${hey}`)')
     ).toMatchInlineSnapshot(
-      '[Error: Invalid glob import syntax: Expected glob to be a string, but got dynamic template literal]'
+      '[Error: Invalid glob import syntax: Expected glob to be a static string, but got dynamic template literal]'
     )
   })
 
@@ -316,12 +316,12 @@ describe('parse negatives', async () => {
 
   it('be array variable', async () => {
     expect(await runError('import.meta.glob([hey])')).toMatchInlineSnapshot(
-      '[Error: Invalid glob import syntax: Could only use literals]'
+      '[Error: Invalid glob import syntax: Expected glob to be a static string, but got "Identifier"]'
     )
     expect(
       await runError('import.meta.glob(["1", hey])')
     ).toMatchInlineSnapshot(
-      '[Error: Invalid glob import syntax: Could only use literals]'
+      '[Error: Invalid glob import syntax: Expected glob to be a static string, but got "Identifier"]'
     )
   })
 
