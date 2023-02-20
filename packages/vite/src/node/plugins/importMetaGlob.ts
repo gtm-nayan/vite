@@ -251,7 +251,7 @@ export async function parseImportGlob(
       }
     }
 
-    const found = findCallExprAt(ast as any, start)
+    const found = findCallExprAt(ast, start)
     if (!found) throw err(`Expect CallExpression, got ${ast.type}`)
     ast = found
 
