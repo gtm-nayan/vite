@@ -14,11 +14,12 @@ import type {
 } from 'estree'
 import { parseExpressionAt } from 'acorn'
 import type { RollupError } from 'rollup'
-import { findNodeAt } from 'acorn-walk'
 import MagicString from 'magic-string'
 import fg from 'fast-glob'
 import { stringifyQuery } from 'ufo'
 import type { GeneralImportGlobOptions } from 'types/importGlob'
+// eslint-disable-next-line node/no-missing-import
+import { walk as eswalk } from 'estree-walker'
 import type { Plugin } from '../plugin'
 import type { ViteDevServer } from '../server'
 import type { ModuleNode } from '../server/moduleGraph'
@@ -30,6 +31,27 @@ import {
   transformStableResult,
 } from '../utils'
 import { isCSSRequest, isModuleCSSRequest } from './css'
+
+function findCallExprAt(ast: Node, location: number) {
+  let found: CallExpression | undefined
+
+  eswalk(ast, {
+    enter(node) {
+      if (node.range![0] > location) this.skip()
+    },
+    leave(node) {
+      if (
+        !found &&
+        node.range![0] === location &&
+        node.type === 'CallExpression'
+      ) {
+        found = node
+      }
+    },
+  })
+
+  return found
+}
 
 const { isMatch, scan } = micromatch
 
@@ -236,9 +258,9 @@ export async function parseImportGlob(
       }
     }
 
-    const found = findNodeAt(ast as any, start, undefined, 'CallExpression')
+    const found = findCallExprAt(ast as any, start)
     if (!found) throw err(`Expect CallExpression, got ${ast.type}`)
-    ast = found.node as unknown as CallExpression
+    ast = found
 
     if (ast.arguments.length < 1 || ast.arguments.length > 2)
       throw err(`Expected 1-2 arguments, but got ${ast.arguments.length}`)
