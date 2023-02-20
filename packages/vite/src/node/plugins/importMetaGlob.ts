@@ -238,7 +238,7 @@ export async function parseImportGlob(
 
       if (lastToken.type === tokTypes.comma) {
         // Parser will choke on trailing comma since we started parsing at the
-        // middle of an array or something. We can strip the trailing comma and try again.
+        // middle of a sequence. We can strip the trailing comma and try again.
         const stripped = code.slice(0, lastToken.start)
 
         ast = parseExpressionAt(stripped, start, {
