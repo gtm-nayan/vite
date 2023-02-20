@@ -6,13 +6,11 @@ import type {
   CallExpression,
   Expression,
   Literal,
-  MemberExpression,
   Node,
-  SequenceExpression,
   SpreadElement,
   TemplateLiteral,
 } from 'estree'
-import { parseExpressionAt } from 'acorn'
+import { type Token, parseExpressionAt, tokTypes } from 'acorn'
 import type { RollupError } from 'rollup'
 import MagicString from 'magic-string'
 import fg from 'fast-glob'
@@ -222,8 +220,8 @@ export async function parseImportGlob(
       return e
     }
 
-    let ast: CallExpression | SequenceExpression | MemberExpression
-    let lastTokenPos: number | undefined
+    let ast: Node
+    let lastToken!: Token
 
     try {
       ast = parseExpressionAt(code, start, {
@@ -231,30 +229,25 @@ export async function parseImportGlob(
         sourceType: 'module',
         ranges: true,
         onToken: (token) => {
-          lastTokenPos = token.end
+          lastToken = token
         },
-      }) as any
+      }) as Node
     } catch (e) {
-      const _e = e as any
-      if (_e.message && _e.message.startsWith('Unterminated string constant'))
+      if (e.message?.startsWith('Unterminated string constant'))
         return undefined!
-      if (lastTokenPos == null || lastTokenPos <= start) throw _e
 
-      // tailing comma in object or array will make the parser think it's a comma operation
-      // we try to parse again removing the comma
-      try {
-        const statement = code.slice(start, lastTokenPos).replace(/[,\s]*$/, '')
-        ast = parseExpressionAt(
-          ' '.repeat(start) + statement, // to keep the ast position
-          start,
-          {
-            ecmaVersion: 'latest',
-            sourceType: 'module',
-            ranges: true,
-          },
-        ) as any
-      } catch {
-        throw _e
+      if (lastToken.type === tokTypes.comma) {
+        // Parser will choke on trailing comma since we started parsing at the
+        // middle of an array or something. We can strip the trailing comma and try again.
+        const stripped = code.slice(0, lastToken.start)
+
+        ast = parseExpressionAt(stripped, start, {
+          ecmaVersion: 'latest',
+          sourceType: 'module',
+          ranges: true,
+        }) as Node
+      } else {
+        throw e
       }
     }
 
